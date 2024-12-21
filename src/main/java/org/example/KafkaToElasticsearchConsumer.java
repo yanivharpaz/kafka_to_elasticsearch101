@@ -141,14 +141,34 @@ public class KafkaToElasticsearchConsumer {
         return DEFAULT_INDEX;
     }
 
-    private void ensureIndexExists(String indexName) throws IOException {
+    private String getIndexName(String productType) {
+        LocalDate today = LocalDate.now();
+        return String.format("%s%s_%s", INDEX_PREFIX, productType, today.format(DateTimeFormatter.ISO_DATE));
+    }
+
+    private String getAliasName(String productType) {
+        return String.format("%s%s", INDEX_PREFIX, productType);
+    }
+
+    private void ensureIndexAndAliasExist(String productType) throws IOException {
+        String indexName = getIndexName(productType);
+        String aliasName = getAliasName(productType);
+
+        // Check if the index exists
         GetIndexRequest getIndexRequest = new GetIndexRequest(indexName);
         boolean indexExists = elasticsearchClient.indices().exists(getIndexRequest, RequestOptions.DEFAULT);
 
         if (!indexExists) {
-            CreateIndexRequest createIndexRequest = new CreateIndexRequest(indexName);
+            // Create the index
+            CreateIndexRequest createIndexRequest = new CreateIndexRequest(indexName)
+                    .source("{\n" +
+                            "    \"aliases\": {\n" +
+                            "        \"" + aliasName + "\": {}\n" +
+                            "    }\n" +
+                            "}", XContentType.JSON);
+
             elasticsearchClient.indices().create(createIndexRequest, RequestOptions.DEFAULT);
-            System.out.println("Created new index: " + indexName);
+            System.out.println("Created new index: " + indexName + " with alias: " + aliasName);
         }
     }
 
@@ -162,12 +182,12 @@ public class KafkaToElasticsearchConsumer {
                 for (JsonNode node : jsonNodes) {
                     String productType = node.has("product_type") ?
                             node.get("product_type").asText().toLowerCase() : "unknown";
-                    String indexName = INDEX_PREFIX + productType;
+                    String aliasName = getAliasName(productType);
 
-                    System.out.println("Using index name: " + indexName + " for item: " + node.toString());
-                    ensureIndexExists(indexName);
+                    System.out.println("Using alias name: " + aliasName + " for item: " + node.toString());
+                    ensureIndexAndAliasExist(productType);
 
-                    IndexRequest indexRequest = new IndexRequest(indexName, "_doc")
+                    IndexRequest indexRequest = new IndexRequest(aliasName, "_doc")
                             .id(UUID.randomUUID().toString())
                             .source(node.toString(), XContentType.JSON);
 
@@ -179,12 +199,12 @@ public class KafkaToElasticsearchConsumer {
                 // Handle single object
                 String productType = jsonNodes.has("product_type") ?
                         jsonNodes.get("product_type").asText().toLowerCase() : "unknown";
-                String indexName = INDEX_PREFIX + productType;
+                String aliasName = getAliasName(productType);
 
-                System.out.println("Using index name: " + indexName);
-                ensureIndexExists(indexName);
+                System.out.println("Using alias name: " + aliasName);
+                ensureIndexAndAliasExist(productType);
 
-                IndexRequest indexRequest = new IndexRequest(indexName, "_doc")
+                IndexRequest indexRequest = new IndexRequest(aliasName, "_doc")
                         .id(UUID.randomUUID().toString())
                         .source(message, XContentType.JSON);
 
