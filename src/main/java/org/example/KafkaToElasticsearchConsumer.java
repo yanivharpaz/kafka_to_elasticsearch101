@@ -1,6 +1,7 @@
 package org.example;
 
 import org.apache.http.HttpHost;
+import org.apache.http.util.EntityUtils;
 import org.apache.kafka.clients.consumer.*;
 import org.apache.kafka.clients.producer.*;
 import org.apache.kafka.common.TopicPartition;
@@ -10,8 +11,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.core.JsonParseException;
 import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
+import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.index.IndexResponse;
+import org.elasticsearch.client.Request;
+import org.elasticsearch.client.Response;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestHighLevelClient;
@@ -28,11 +32,14 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.Future;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class KafkaToElasticsearchConsumer {
     private final KafkaConsumer<String, String> kafkaConsumer;
     private final KafkaProducer<String, String> dlqProducer;
     private final RestHighLevelClient elasticsearchClient;
+    private final Map<String, String> aliasCache;  // Cache to store alias -> index mappings
+    private final Map<String, Integer> indexCounters;  // Cache to store product type -> current index number
     private static final String INDEX_PREFIX = "prd_a_";
     private static final String DEFAULT_INDEX = "prd_a_unknown";
     private static final String SOURCE_TOPIC = "my-topic";
@@ -44,6 +51,9 @@ public class KafkaToElasticsearchConsumer {
         this.kafkaConsumer = createKafkaConsumer();
         this.dlqProducer = createDlqProducer();
         this.elasticsearchClient = createElasticsearchClient();
+        this.aliasCache = new ConcurrentHashMap<>();
+        this.indexCounters = new ConcurrentHashMap<>();
+        initializeAliasCache();
     }
 
     private KafkaConsumer<String, String> createKafkaConsumer() {
@@ -53,7 +63,7 @@ public class KafkaToElasticsearchConsumer {
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");  // Changed to manual commit
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
 
         return new KafkaConsumer<>(props);
     }
@@ -77,6 +87,57 @@ public class KafkaToElasticsearchConsumer {
         );
     }
 
+    private void initializeAliasCache() {
+        try {
+            // Get all indices using low-level client
+            Response response = elasticsearchClient.getLowLevelClient()
+                    .performRequest(new Request("GET", "/_alias"));
+
+            // Parse the response
+            String responseBody = EntityUtils.toString(response.getEntity());
+            ObjectMapper mapper = new ObjectMapper();
+            Map<String, Object> aliasMap = mapper.readValue(responseBody, Map.class);
+
+            // Process each index and its aliases
+            for (Map.Entry<String, Object> entry : aliasMap.entrySet()) {
+                String indexName = entry.getKey();
+                // Update index counters based on existing indices
+                if (indexName.startsWith(INDEX_PREFIX)) {
+                    try {
+                        String[] parts = indexName.split("_");
+                        if (parts.length >= 4) {  // prefix_producttype_number
+                            String productType = parts[parts.length - 2];
+                            int indexNumber = Integer.parseInt(parts[parts.length - 1]);
+                            indexCounters.merge(productType, indexNumber, Integer::max);
+                        }
+                    } catch (NumberFormatException e) {
+                        // Skip if the index name doesn't match our expected format
+                        continue;
+                    }
+                }
+
+                @SuppressWarnings("unchecked")
+                Map<String, Object> aliasInfo = (Map<String, Object>) entry.getValue();
+
+                if (aliasInfo.containsKey("aliases")) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> aliases = (Map<String, Object>) aliasInfo.get("aliases");
+                    for (String aliasName : aliases.keySet()) {
+                        if (aliasName.startsWith(INDEX_PREFIX)) {
+                            aliasCache.put(aliasName, indexName);
+                            System.out.println("Cached alias mapping: " + aliasName + " -> " + indexName);
+                        }
+                    }
+                }
+            }
+            System.out.println("Initialized alias cache with " + aliasCache.size() + " entries");
+            System.out.println("Initialized index counters: " + indexCounters);
+        } catch (Exception e) {
+            System.err.println("Error initializing alias cache: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
     private void sendToDlq(ConsumerRecord<String, String> record, Exception error) {
         Map<String, Object> dlqMessage = new HashMap<>();
         dlqMessage.put("original_message", record.value());
@@ -93,7 +154,7 @@ public class KafkaToElasticsearchConsumer {
 
         try {
             Future<RecordMetadata> future = dlqProducer.send(dlqRecord);
-            RecordMetadata metadata = future.get();  // Wait for acknowledgment
+            RecordMetadata metadata = future.get();
             System.out.printf("Message sent to DLQ - Topic: %s, Partition: %d, Offset: %d%n",
                     metadata.topic(), metadata.partition(), metadata.offset());
         } catch (Exception e) {
@@ -112,7 +173,7 @@ public class KafkaToElasticsearchConsumer {
                 }
 
                 indexToElasticsearch(record.value());
-                return;  // Success - exit the method
+                return;
 
             } catch (Exception e) {
                 lastException = e;
@@ -121,29 +182,20 @@ public class KafkaToElasticsearchConsumer {
             }
         }
 
-        // If we get here, all retries failed
         if (lastException != null) {
             sendToDlq(record, lastException);
         }
     }
 
-    private String getIndexNameFromMessage(String message) {
-        try {
-            ObjectMapper mapper = new ObjectMapper();
-            JsonNode jsonNode = mapper.readTree(message);
-            if (jsonNode.has("product_type")) {
-                String productType = jsonNode.get("product_type").asText().toLowerCase();
-                return INDEX_PREFIX + productType;
-            }
-        } catch (Exception e) {
-            System.err.println("Error parsing message JSON: " + e.getMessage());
-        }
-        return DEFAULT_INDEX;
+    private synchronized int getNextIndexNumber(String productType) {
+        int currentNumber = indexCounters.getOrDefault(productType, 0);
+        int nextNumber = currentNumber + 1;
+        indexCounters.put(productType, nextNumber);
+        return nextNumber;
     }
 
     private String getIndexName(String productType) {
-        LocalDate today = LocalDate.now();
-        return String.format("%s%s_%s", INDEX_PREFIX, productType, today.format(DateTimeFormatter.ISO_DATE));
+        return String.format("%s%s_%05d", INDEX_PREFIX, productType, getNextIndexNumber(productType));
     }
 
     private String getAliasName(String productType) {
@@ -154,21 +206,134 @@ public class KafkaToElasticsearchConsumer {
         String indexName = getIndexName(productType);
         String aliasName = getAliasName(productType);
 
-        // Check if the index exists
-        GetIndexRequest getIndexRequest = new GetIndexRequest(indexName);
-        boolean indexExists = elasticsearchClient.indices().exists(getIndexRequest, RequestOptions.DEFAULT);
+        System.out.println("Checking index and alias existence for product type: " + productType);
+        System.out.println("Index name: " + indexName + ", Alias name: " + aliasName);
 
-        if (!indexExists) {
-            // Create the index
-            CreateIndexRequest createIndexRequest = new CreateIndexRequest(indexName)
-                    .source("{\n" +
-                            "    \"aliases\": {\n" +
-                            "        \"" + aliasName + "\": {}\n" +
+        try {
+            // First check the cache
+            String existingIndex = aliasCache.get(aliasName);
+            if (existingIndex != null) {
+                System.out.println("Found existing alias in cache: " + aliasName + " -> " + existingIndex);
+
+                // Verify that the cached index actually exists
+                GetIndexRequest verifyRequest = new GetIndexRequest(existingIndex);
+                boolean indexExists = elasticsearchClient.indices().exists(verifyRequest, RequestOptions.DEFAULT);
+                if (!indexExists) {
+                    System.out.println("Warning: Cached index " + existingIndex + " no longer exists. Will create new index and alias.");
+                    aliasCache.remove(aliasName);
+                } else {
+                    System.out.println("Verified cached index exists. Using existing index and alias.");
+                    return;
+                }
+            }
+
+            // Check if the new index exists
+            GetIndexRequest getIndexRequest = new GetIndexRequest(indexName);
+            boolean indexExists = elasticsearchClient.indices().exists(getIndexRequest, RequestOptions.DEFAULT);
+
+            if (!indexExists) {
+                try {
+                    // Create the index
+                    System.out.println("Creating new index: " + indexName);
+                    CreateIndexRequest createIndexRequest = new CreateIndexRequest(indexName);
+                    createIndexRequest.source("{\n" +
+                            "    \"settings\": {\n" +
+                            "        \"number_of_shards\": 3,\n" +
+                            "        \"number_of_replicas\": 1\n" +
                             "    }\n" +
                             "}", XContentType.JSON);
 
-            elasticsearchClient.indices().create(createIndexRequest, RequestOptions.DEFAULT);
-            System.out.println("Created new index: " + indexName + " with alias: " + aliasName);
+                    elasticsearchClient.indices().create(createIndexRequest, RequestOptions.DEFAULT);
+                    System.out.println("Successfully created index: " + indexName);
+
+                    try {
+                        // Create the alias using low-level client
+                        System.out.println("Creating alias: " + aliasName + " -> " + indexName);
+                        String aliasPayload = String.format("""
+                            {
+                                "actions": [
+                                    {
+                                        "add": {
+                                            "index": "%s",
+                                            "alias": "%s",
+                                            "is_write_index": true
+                                        }
+                                    }
+                                ]
+                            }""", indexName, aliasName);
+
+                        Request aliasRequest = new Request("POST", "/_aliases");
+                        aliasRequest.setJsonEntity(aliasPayload);
+
+                        Response aliasResponse = elasticsearchClient.getLowLevelClient().performRequest(aliasRequest);
+                        int statusCode = aliasResponse.getStatusLine().getStatusCode();
+
+                        if (statusCode >= 200 && statusCode < 300) {
+                            System.out.println("Successfully created alias: " + aliasName);
+                            aliasCache.put(aliasName, indexName);
+                            System.out.println("Updated alias cache: " + aliasName + " -> " + indexName);
+                        } else {
+                            throw new IOException("Failed to create alias. Status code: " + statusCode);
+                        }
+
+                    } catch (Exception e) {
+                        System.err.println("Error creating alias: " + e.getMessage());
+                        // Try to clean up the index if alias creation failed
+                        try {
+                            System.out.println("Attempting to clean up index after alias creation failure");
+                            elasticsearchClient.indices().delete(new DeleteIndexRequest(indexName), RequestOptions.DEFAULT);
+                            System.out.println("Successfully cleaned up index: " + indexName);
+                        } catch (Exception cleanupError) {
+                            System.err.println("Failed to clean up index after alias creation failure: " + cleanupError.getMessage());
+                        }
+                        throw new IOException("Failed to create alias", e);
+                    }
+                } catch (Exception e) {
+                    System.err.println("Error creating index: " + e.getMessage());
+                    throw new IOException("Failed to create index and alias", e);
+                }
+            } else {
+                System.out.println("Index " + indexName + " already exists. Verifying alias.");
+                // Verify if the alias exists and create if it doesn't
+                try {
+                    Request checkAliasRequest = new Request("GET", "/_alias/" + aliasName);
+                    Response checkAliasResponse = elasticsearchClient.getLowLevelClient().performRequest(checkAliasRequest);
+
+                    if (checkAliasResponse.getStatusLine().getStatusCode() == 404) {
+                        System.out.println("Alias doesn't exist. Creating alias: " + aliasName);
+                        // Create the alias
+                        String aliasPayload = String.format("""
+                            {
+                                "actions": [
+                                    {
+                                        "add": {
+                                            "index": "%s",
+                                            "alias": "%s",
+                                            "is_write_index": true
+                                        }
+                                    }
+                                ]
+                            }""", indexName, aliasName);
+
+                        Request aliasRequest = new Request("POST", "/_aliases");
+                        aliasRequest.setJsonEntity(aliasPayload);
+                        elasticsearchClient.getLowLevelClient().performRequest(aliasRequest);
+                        System.out.println("Successfully created alias: " + aliasName);
+                    } else {
+                        System.out.println("Alias " + aliasName + " already exists");
+                    }
+
+                    aliasCache.put(aliasName, indexName);
+                    System.out.println("Updated alias cache: " + aliasName + " -> " + indexName);
+                } catch (Exception e) {
+                    System.err.println("Error verifying/creating alias: " + e.getMessage());
+                    throw new IOException("Failed to verify/create alias", e);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Critical error in ensureIndexAndAliasExist: " + e.getMessage());
+            e.printStackTrace();
+            throw new IOException("Failed to ensure index and alias existence", e);
         }
     }
 
@@ -196,7 +361,6 @@ public class KafkaToElasticsearchConsumer {
                             response.getId(), response.getResult().name());
                 }
             } else {
-                // Handle single object
                 String productType = jsonNodes.has("product_type") ?
                         jsonNodes.get("product_type").asText().toLowerCase() : "unknown";
                 String aliasName = getAliasName(productType);
@@ -231,7 +395,6 @@ public class KafkaToElasticsearchConsumer {
 
                     try {
                         indexToElasticsearchWithRetry(record);
-                        // Commit offset only after successful processing or DLQ
                         kafkaConsumer.commitSync(Collections.singletonMap(
                                 new TopicPartition(record.topic(), record.partition()),
                                 new OffsetAndMetadata(record.offset() + 1)
