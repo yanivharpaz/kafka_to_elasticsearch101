@@ -1,0 +1,41 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'org.example'
+version = '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.apache.kafka:kafka-clients:2.8.1'
+    implementation 'org.slf4j:slf4j-simple:1.7.36'
+
+
+    implementation 'org.elasticsearch.client:elasticsearch-rest-high-level-client:6.8.0'
+    implementation 'org.elasticsearch:elasticsearch:6.8.0'
+    implementation 'org.elasticsearch.client:elasticsearch-rest-client:6.8.0'
+    implementation 'org.apache.logging.log4j:log4j-core:2.17.1'
+    implementation 'org.apache.logging.log4j:log4j-api:2.17.1'
+
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
+
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+tasks.withType(JavaCompile) {
+    options.compilerArgs << "-Xlint:deprecation"
+}
+
+test {
+    useJUnitPlatform()
+}
+
+application {
+    mainClassName = "org.example.KafkaToElasticsearchConsumer"
+//        mainClassName = "org.example.ElasticsearchWriter"
+}
